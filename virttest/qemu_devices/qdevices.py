@@ -657,11 +657,21 @@ class QBlockdevNode(QCustomDevice):
         super(QBlockdevNode, self).__init__(
             "blockdev", {}, aobject, (), child_bus)
 
-        if is_root:
-            self.params['node-name'] = '%s_%s' % ('drive', aobject)
-        else:
-            self.params['node-name'] = '%s_%s' % (self.TYPE, aobject)
+        self.is_root=is_root
+        # if is_root:
+        #     self.params['node-name'] = '%s_%s' % ('drive', aobject)
+        # else:
+        #     self.params['node-name'] = '%s_%s' % (self.TYPE, aobject)
+        self.set_root(is_root)
         self.set_param('driver', self.TYPE)
+
+    def set_root(self,flag):
+        self.is_root = flag
+        if self.is_root:
+            self.params['node-name'] = '%s_%s' % ('drive', self.aobject)
+        else:
+            self.params['node-name'] = '%s_%s' % (self.TYPE, self.aobject)
+
 
     @staticmethod
     def _convert_blkdev_args(args):
@@ -783,6 +793,7 @@ class QBlockdevFormatNode(QBlockdevNode):
         :param node: the blockdev node which will be added.
         :type node: qdevices.QBlockdevNode
         """
+        node.set_root(False)
         self._child_nodes.append(node)
 
     def del_child_node(self, node):
@@ -883,6 +894,20 @@ class QBlockdevProtocolRBD(QBlockdevProtocol):
     """ New a protocol rbd blockdev node. """
     TYPE = 'rbd'
 
+
+class QBlockdevFilter(QBlockdevFormatNode):
+    pass
+
+
+class QBlockdevFilterThrottle(QBlockdevFilter):
+    TYPE= "throttle"
+
+    def __init__(self, aobject,group):
+
+        # busid='throttle_%s' % aobject
+        # print("throttle busid:"+busid)
+        super(QBlockdevFilterThrottle, self).__init__(aobject)
+        self.set_param("throttle-group",group)
 
 class QDevice(QCustomDevice):
 
@@ -1211,6 +1236,106 @@ class QIOThread(QObject):
     def verify_unplug(self, out, monitor):
         """Verify if it is unplugged from VM."""
         return not self._is_attached_to_qemu(monitor)
+
+
+class QThrottleGroup(QObject):
+    """throttle-group object.
+    attributes of throttle-group
+
+    """
+    KEY_MAP_TABLE={"iops":"x-iops"}
+
+    def __init__(self, throttle_group_id, raw):
+        if not raw:
+            #set default
+            pass
+
+        self.raw=raw
+        l=[]
+        for item in raw.split(","):
+            l.append(tuple(item.split("=")))
+        params=dict(l)
+        params["id"] = throttle_group_id
+        kwargs = dict(backend="throttle-group", params=params)
+        super(QThrottleGroup, self).__init__(**kwargs)
+        self.set_aid(throttle_group_id)
+        self.hook_drive_bus = None
+
+    # def __init__(self, throttle_group_id, params=None):
+    #     if params is None:
+    #         params = dict()
+    #     params["id"] = throttle_group_id
+    #     kwargs = dict(backend="throttle-group", params=params)
+    #     super(QThrottleGroup, self).__init__(**kwargs)
+    #     self.set_aid(throttle_group_id)
+    #     # self.iothread_bus = QIOThreadBus(throttle_group_id)
+    #     # self.add_child_bus(self.iothread_bus)
+
+
+    # def unplug_hook(self):
+    #     """Remove iothread from attached devices' params."""
+    #     for device in self.iothread_bus:
+    #         device.set_param("iothread", None)
+    #
+    # def unplug_unhook(self):
+    #     """Reset attached devices' params."""
+    #     for device in self.iothread_bus:
+    #         device.set_param(self.get_qid())
+
+    def hotplug_qmp(self):
+        """Return hotplug qmp command string."""
+        params = dict(self.params)
+        backend = params.pop("backend")
+        iothread_id = params.pop("id")
+        kwargs = {"qom-type": backend, "id": iothread_id, "props": { "limits":params}}
+        return "object-add", kwargs
+
+    def _is_attached_to_qemu(self, monitor):
+        """Check if iothread is in use by QEMU."""
+        out = QIOThread._query(monitor)
+        return any(self.get_qid() == iothread["id"] for iothread in out)
+
+    def verify_hotplug(self, out, monitor):
+        """Verify if it is plugged into VM."""
+        return self._is_attached_to_qemu(monitor)
+
+    def verify_unplug(self, out, monitor):
+        """Verify if it is unplugged from VM."""
+        return not self._is_attached_to_qemu(monitor)
+
+
+class ThrottleGroupManager(object):
+    def __init__(self):
+        self.groups = {}
+
+    def set_monitor(self,monitor):
+        self.monitor=monitor
+
+    def create_throttle_group(self, throttle_group_id, raw_string):
+        self.groups[throttle_group_id]=QThrottleGroup(throttle_group_id,raw_string)
+        return self.groups[throttle_group_id]
+
+    #object-add
+    def add_throttle_group(self, throttle_group_id, raw_string,monitor=None):
+        pass
+    #object-del
+    def delete_throttle_group(self, throttle_group_id,monitor=None):
+        pass
+
+    #return QThrottleGroup
+    def get_throttle_group(self, throttle_group_id):
+        pass
+
+    def query_throttle_group(self, throttle_group_id,monitor=None):
+        pass
+
+    #qom-set
+    def update_throttle_group(self, throttle_group_id,raw_string,monitor=None):
+        pass
+
+    #x-blockdev-reopen
+    def change_blockdev_other_group(self,node_name,file,throttle_group_id,monitor=None):
+        pass
 
 
 class Memory(QObject):

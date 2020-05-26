@@ -24,6 +24,8 @@ from avocado.utils import process
 import six
 from six.moves import xrange
 
+from virttest.qemu_devices.qdevices import ThrottleGroupManager
+
 try:
     from collections.abc import Sequence
 except ImportError:
@@ -164,6 +166,11 @@ class DevContainer(object):
         self.__iothread_manager = None
         self.__iothread_supported_devices = set()
         self.temporary_image_snapshots = set()
+        self.throttle_group_manger = ThrottleGroupManager()
+
+    #wq
+    def get_throttle_group_manger(self):
+        return self.throttle_group_manger
 
     def initialize_iothread_manager(self, params, guestcpuinfo):
         """Initialize iothread manager.
@@ -1556,7 +1563,7 @@ class DevContainer(object):
                                    scsi=None, drv_extra_params=None,
                                    num_queues=None, bus_extra_params=None,
                                    force_fmt=None, image_encryption=None,
-                                   image_access=None):
+                                   image_access=None, image_filter_throttle=None):
         """
         Creates related devices by variables
         :note: To skip the argument use None, to disable it use False
@@ -1888,6 +1895,18 @@ class DevContainer(object):
             format_node.add_child_node(protocol_node)
             devices.append(protocol_node)
             devices.append(format_node)
+            top_node=format_node
+            # wq add filter node
+            if image_filter_throttle:
+                filter_node=qdevices.QBlockdevFilterThrottle(name,image_filter_throttle)
+                filter_node.add_child_node(format_node)
+                devices.append(filter_node)
+                top_node=filter_node
+                # devices.insert(-2,filter_node)
+                filter_node.set_param('file', format_node.get_qid())
+                format_node.set_param('file', protocol_node.get_qid())
+
+
         else:
             if self.has_hmp_cmd('__com.redhat_drive_add') and use_device:
                 devices.append(qdevices.QRHDrive(name))
@@ -1898,6 +1917,9 @@ class DevContainer(object):
             else:       # very old qemu without 'addr' support
                 devices.append(qdevices.QOldDrive(name, use_device))
 
+            format_node = devices[-1]
+            protocol_node = format_node
+
         if Flags.BLOCKDEV in self.caps:
             for opt, val in zip(('serial', 'boot'), (serial, boot)):
                 if val is not None:
@@ -1905,16 +1927,16 @@ class DevContainer(object):
                                  "on %s by -blockdev." % (opt, name))
             if media == 'cdrom':
                 readonly = 'on'
-            devices[-2].set_param('read-only', readonly, bool)
-            devices[-1].set_param('read-only', readonly, bool)
+            protocol_node.set_param('read-only', readonly, bool)
+            format_node.set_param('read-only', readonly, bool)
             if secret_obj:
-                if isinstance(devices[-1], qdevices.QBlockdevFormatQcow2):
-                    devices[-1].set_param('encrypt.format',
+                if isinstance(format_node, qdevices.QBlockdevFormatQcow2):
+                    format_node.set_param('encrypt.format',
                                           image_encryption.format)
-                    devices[-1].set_param('encrypt.key-secret',
+                    format_node.set_param('encrypt.key-secret',
                                           secret_obj.get_qid())
-                elif isinstance(devices[-1], qdevices.QBlockdevFormatLuks):
-                    devices[-1].set_param('key-secret', secret_obj.get_qid())
+                elif isinstance(format_node, qdevices.QBlockdevFormatLuks):
+                    format_node.set_param('key-secret', secret_obj.get_qid())
         else:
             devices[-1].set_param('if', 'none')
             devices[-1].set_param('rerror', rerror)
@@ -1937,12 +1959,12 @@ class DevContainer(object):
                 logging.warn('snapshot is on, fallback aio to threads.')
                 aio = 'threads'
             if Flags.BLOCKDEV in self.caps:
-                if isinstance(devices[-2], (qdevices.QBlockdevProtocolFile,
+                if isinstance(protocol_node, (qdevices.QBlockdevProtocolFile,
                                             qdevices.QBlockdevProtocolHostDevice,
                                             qdevices.QBlockdevProtocolHostCdrom)):
-                    devices[-2].set_param('aio', aio)
+                    protocol_node.set_param('aio', aio)
             else:
-                devices[-1].set_param('aio', aio)
+                format_node.set_param('aio', aio)
             if aio == 'native':
                 # Since qemu 2.6, aio=native has no effect without
                 # cache.direct=on or cache=none, It will be error out.
@@ -1956,20 +1978,20 @@ class DevContainer(object):
             if filename:
                 file_opts = qemu_storage.filename_to_file_opts(filename)
                 for key, value in six.iteritems(file_opts):
-                    devices[-2].set_param(key, value)
+                    protocol_node.set_param(key, value)
 
             if access_secret is not None:
                 if secret_type == 'password':
-                    devices[-2].set_param('password-secret',
+                    protocol_node.set_param('password-secret',
                                           access_secret_obj.get_qid())
                 elif secret_type == 'key':
-                    devices[-2].set_param('key-secret',
+                    protocol_node.set_param('key-secret',
                                           access_secret_obj.get_qid())
 
             if iscsi_initiator:
-                devices[-2].set_param('initiator-name', iscsi_initiator)
+                protocol_node.set_param('initiator-name', iscsi_initiator)
 
-            for dev in (devices[-1], devices[-2]):
+            for dev in (format_node, protocol_node):
                 if not cache:
                     direct, no_flush = (None, None)
                 else:
@@ -1977,7 +1999,8 @@ class DevContainer(object):
                                         self.cache_map[cache]['cache.no-flush'])
                 dev.set_param('cache.direct', direct)
                 dev.set_param('cache.no-flush', no_flush)
-            devices[-1].set_param('file', devices[-2].get_qid())
+
+            format_node.set_param('file', protocol_node.get_qid())
         else:
             devices[-1].set_param('cache', cache)
             devices[-1].set_param('media', media)
@@ -2005,8 +2028,8 @@ class DevContainer(object):
                 if Flags.BLOCKDEV in self.caps:
                     if key == 'discard':
                         value = re.sub('on', 'unmap', re.sub('off', 'ignore', value))
-                    devices[-2].set_param(key, value)
-                devices[-1].set_param(key, value)
+                    protocol_node.set_param(key, value)
+                format_node.set_param(key, value)
         if not use_device:
             if fmt and fmt.startswith('scsi-'):
                 if scsi_hba == 'lsi53c895a' or scsi_hba == 'spapr-vscsi':
@@ -2015,24 +2038,24 @@ class DevContainer(object):
                                    'pflash', 'virtio'):
                 raise virt_vm.VMDeviceNotSupportedError(self.vmname,
                                                         fmt)
-            devices[-1].set_param('if', fmt)    # overwrite previously set None
+            format_node.set_param('if', fmt)    # overwrite previously set None
             if not fmt:     # When fmt unspecified qemu uses ide
                 fmt = 'ide'
-            devices[-1].set_param('index', index)
+            format_node.set_param('index', index)
             if fmt == 'ide':
-                devices[-1].parent_bus = ({'type': fmt.upper(), 'atype': fmt},)
+                format_node.parent_bus = ({'type': fmt.upper(), 'atype': fmt},)
             elif fmt == 'scsi':
                 if arch.ARCH in ('ppc64', 'ppc64le'):
-                    devices[-1].parent_bus = ({'atype': 'spapr-vscsi',
+                    format_node.parent_bus = ({'atype': 'spapr-vscsi',
                                                'type': 'SCSI'},)
                 else:
-                    devices[-1].parent_bus = ({'atype': 'lsi53c895a',
+                    format_node.parent_bus = ({'atype': 'lsi53c895a',
                                                'type': 'SCSI'},)
             elif fmt == 'floppy':
-                devices[-1].parent_bus = ({'type': fmt},)
+                format_node.parent_bus = ({'type': fmt},)
             elif fmt == 'virtio':
-                devices[-1].set_param('addr', pci_addr)
-                devices[-1].parent_bus = (pci_bus,)
+                format_node.set_param('addr', pci_addr)
+                format_node.parent_bus = (pci_bus,)
             if not media == 'cdrom':
                 logging.warn("Using -drive fmt=xxx for %s is unsupported "
                              "method, false errors might occur.", name)
@@ -2041,6 +2064,7 @@ class DevContainer(object):
         #
         # Device
         #
+        # idx will change above
         devices.append(qdevices.QDevice(params={}, aobject=name))
         devices[-1].parent_bus += ({'busid': 'drive_%s' % name}, dev_parent)
         if fmt in ("ide", "ahci"):
@@ -2230,7 +2254,8 @@ class DevContainer(object):
                                                image_params.get(
                                                    "force_drive_format"),
                                                image_encryption,
-                                               image_access)
+                                               image_access,
+                                               image_params.get("image_filter_throttle"))
 
     def serials_define_by_variables(self, serial_id, serial_type, chardev_id,
                                     bus_type=None, serial_name=None,
@@ -2244,8 +2269,7 @@ class DevContainer(object):
         :param chardev_id: the id of the chardev device
         :param bus_type: bus type of the serial device(optional, virtio only)
         :param serial_name: the name option of serial device(optional)
-        :param bus: the busid of parent bus(optional, virtio only) or
-               a parameter '<new>' which means one new parent bus
+        :param bus: the busid of parent bus(optional, virtio only)
         :param nr: the nr(port) of the parent bus(optional, virtio only)
         :param reg: reg option of isa-serial(optional)
         :param bus_extra_params: extra virtio_serial_pci params
@@ -2257,17 +2281,15 @@ class DevContainer(object):
                             for _ in bus_extra_params.split(',') if _]))
         # For virtio devices, generate controller and create the port device
         if serial_type.startswith('virt'):
-            if not bus or bus == '<new>':
+            if not bus:
                 if bus_type == 'virtio-serial-device':
                     pci_bus = {'type': 'virtio-bus'}
                 else:
                     pci_bus = {'aobject': 'pci.0'}
-                if bus != '<new>':
-                    bus = self.get_first_free_bus(
-                        {'type': 'SERIAL', 'atype': bus_type}, [None, nr])
+                bus = self.get_first_free_bus(
+                    {'type': 'SERIAL', 'atype': bus_type}, [None, nr])
                 #  Multiple virtio console devices can't share a single bus
-                if bus is None or bus == '<new>' or \
-                        serial_type == 'virtconsole':
+                if bus is None or serial_type == 'virtconsole':
                     _hba = bus_type.replace('-', '_') + '%s'
                     bus = self.idx_of_next_named_bus(_hba)
                     bus = self.list_missing_named_buses(
@@ -2541,6 +2563,17 @@ class DevContainer(object):
         return qdevices.QDevice(driver, pcic_params, aobject=name,
                                 parent_bus=parent_bus,
                                 child_bus=bus)
+
+    # wq add
+    def throttle_group_define_by_params(self, params, name):
+        throttle_group_parameter = params.get(
+            "throttle_group_parameter_%s" % name,
+            params.get("throttle_group_parameter"))
+        return self.throttle_group_manger.create_throttle_group(name,
+                                                                throttle_group_parameter)
+
+
+
 
     def memory_object_define_by_params(self, params, name):
         """

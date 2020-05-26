@@ -42,6 +42,7 @@ from virttest import utils_vsock
 from virttest import error_event
 from virttest.compat_52lts import decode_to_text
 from virttest.qemu_devices import qdevices, qcontainer
+from virttest.qemu_devices.qdevices import ThrottleGroupManager
 from virttest.qemu_devices.utils import DeviceError
 from virttest.qemu_capabilities import Flags
 
@@ -201,6 +202,7 @@ class VM(virt_vm.BaseVM):
         self.start_monotonic_time = 0.0
         self.last_boot_index = 0
         self.last_driver_index = 0
+
 
     def check_capability(self, capability):
         """
@@ -1830,6 +1832,12 @@ class VM(virt_vm.BaseVM):
 
         # initialize iothread manager
         devices.initialize_iothread_manager(params, self.cpuinfo)
+
+        # TODO Wq add object throttle command line
+
+        for throttle_group in params.get("throttle_groups",
+                                         "").strip().split():
+            devices.insert(devices.throttle_group_define_by_params(params,throttle_group))
 
         # Add images (harddrives)
         for image_name in params.objects("images"):
