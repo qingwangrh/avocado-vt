@@ -656,11 +656,57 @@ class QBlockdevNode(QCustomDevice):
         super(QBlockdevNode, self).__init__(
             "blockdev", {}, aobject, (), child_bus)
 
-        if is_root:
-            self.params['node-name'] = '%s_%s' % ('drive', aobject)
-        else:
-            self.params['node-name'] = '%s_%s' % (self.TYPE, aobject)
+        self._child_nodes = []
+        self._parent_node = None
+        self.is_root = is_root
+        self.set_root(is_root)
         self.set_param('driver', self.TYPE)
+
+    def set_root(self, flag):
+        self.is_root = flag
+        if self.is_root:
+            self.params['node-name'] = '%s_%s' % ('drive', self.aobject)
+        else:
+            self.params['node-name'] = '%s_%s' % (self.TYPE, self.aobject)
+
+    def get_child_nodes(self):
+        """
+        Get the child blockdev nodes.
+
+        :return: list of child blockdev nodes.
+        :rtype: list
+        """
+        return self._child_nodes
+
+    def set_parent_node(self, node):
+        self._parent_node = node
+
+    def get_parent_node(self):
+        return self._parent_node
+
+    def add_child_node(self, node):
+        """
+        Add a child blockdev node.
+
+        :param node: the blockdev node which will be added.
+        :type node: qdevices.QBlockdevNode
+        """
+        node.set_root(False)
+        self._child_nodes.append(node)
+        node.set_parent_node(self)
+
+    def del_child_node(self, node):
+        """
+        Delete a child blockdev node.
+
+        :param node: the blockdev node which will be deleted.
+        :type node: qdevices.QBlockdevNode
+        """
+        self._child_nodes.remove(node)
+        node.set_parent_node(None)
+
+    def del_child_nodes(self):
+        self._child_nodes.clear()
 
     @staticmethod
     def _convert_blkdev_args(args):
@@ -765,34 +811,6 @@ class QBlockdevFormatNode(QBlockdevNode):
         child_bus = QDriveBus('drive_%s' % aobject, aobject)
         super(QBlockdevFormatNode, self).__init__(aobject, child_bus)
         self.__hook_drive_bus = None
-        self._child_nodes = []
-
-    def get_child_nodes(self):
-        """
-        Get the child blockdev nodes.
-
-        :return: list of child blockdev nodes.
-        :rtype: list
-        """
-        return self._child_nodes
-
-    def add_child_node(self, node):
-        """
-        Add a child blockdev node.
-
-        :param node: the blockdev node which will be added.
-        :type node: qdevices.QBlockdevNode
-        """
-        self._child_nodes.append(node)
-
-    def del_child_node(self, node):
-        """
-        Delete a child blockdev node.
-
-        :param node: the blockdev node which will be deleted.
-        :type node: qdevices.QBlockdevNode
-        """
-        self._child_nodes.remove(node)
 
     def get_children(self):
         """ Device bus should be removed too. """
@@ -882,6 +900,19 @@ class QBlockdevProtocolISCSI(QBlockdevProtocol):
 class QBlockdevProtocolRBD(QBlockdevProtocol):
     """ New a protocol rbd blockdev node. """
     TYPE = 'rbd'
+
+
+class QBlockdevFilter(QBlockdevNode):
+    pass
+
+
+class QBlockdevFilterThrottle(QBlockdevFilter):
+    TYPE = "throttle"
+
+    def __init__(self, aobject, group):
+        super(QBlockdevFilterThrottle, self).__init__(aobject)
+        self.parent_bus = ({"busid": group}, {"type": "ThrottleGroup"})
+        self.set_param("throttle-group", group)
 
 
 class QBlockdevProtocolGluster(QBlockdevProtocol):
@@ -1273,6 +1304,93 @@ class QIOThread(QObject):
     def verify_unplug(self, out, monitor):
         """Verify if it is unplugged from VM."""
         return not self._is_attached_to_qemu(monitor)
+
+
+class QThrottleGroup(QObject):
+    """
+    throttle-group object.
+    attributes of throttle-group
+    """
+
+    KEY_MAP_TABLE = {"bps-read-max-length": "x-bps-read-max-length",
+                     "iops-read-max-length": "x-iops-read-max-length",
+                     "bps-read-max": "x-bps-read-max",
+                     "bps-total": "x-bps-total",
+                     "iops-total-max-length": "x-iops-total-max-length",
+                     "iops-total": "x-iops-total",
+                     "iops-write-max": "x-iops-write-max",
+                     "bps-write": "x-bps-write",
+                     "bps-total-max": "x-bps-total-max",
+                     "bps-write-max": "x-bps-write-max",
+                     "iops-size": "x-iops-size",
+                     "iops-read": "x-iops-read",
+                     "iops-write-max-length": "x-iops-write-max-length",
+                     "iops-write": "x-iops-write",
+                     "bps-total-max-length": "x-bps-total-max-length",
+                     "iops-read-max": "x-iops-read-max",
+                     "bps-read": "x-bps-read",
+                     "bps-write-max-length": "x-bps-write-max-length",
+                     "iops-total-max": "x-iops-total-max"}
+
+    def __init__(self, throttle_group_id, raw):
+        if not raw or len(raw) == 0:
+            logging.warning("Using empty value :%s" % throttle_group_id)
+            raw = ""
+
+        self.raw_string = raw
+        attrs = []
+        for item in raw.split(","):
+            attr = item.split("=")
+            if len(attr) == 2:
+                attrs.append(tuple([attr[0], int(attr[1])]))
+        self.raw_limits = dict(attrs)
+
+        if not QThrottleGroup._check_key(self.raw_limits):
+            raise DeviceError("Throttle %s key error:%s" % (
+                throttle_group_id, self.raw_limits))
+
+        params = QThrottleGroup._map_key(self.raw_limits)
+        params["id"] = throttle_group_id
+        kwargs = dict(backend="throttle-group", params=params)
+        super(QThrottleGroup, self).__init__(**kwargs)
+        self.throttle_group_bus = QThrottleGroupBus(throttle_group_id)
+        self.add_child_bus(self.throttle_group_bus)
+        self.set_aid(throttle_group_id)
+        self.hook_drive_bus = None
+
+    @staticmethod
+    def _check_key(params):
+        return set(params.keys()) <= set(QThrottleGroup.KEY_MAP_TABLE.keys())
+
+    @staticmethod
+    def _map_key(params):
+        return {QThrottleGroup.KEY_MAP_TABLE[key]: params[key] for key in
+                params.keys()}
+
+    def hotplug_qmp(self):
+        """Return hotplug qmp command string."""
+        params = dict(self.params)
+        backend = params.pop("backend")
+        throttle_group_id = params.pop("id")
+        kwargs = {"qom-type": backend, "id": throttle_group_id,
+                  "props": {"limits": self.raw_limits}}
+        return "object-add", kwargs
+
+    def query(self, monitor):
+        """Check if throttle is in use by QEMU."""
+        try:
+            return monitor.qom_get(self.params["id"], "limits")
+        except Exception as err:
+            logging.warning(err)
+            return None
+
+    def verify_hotplug(self, out, monitor):
+        """Verify if it is plugged into VM."""
+        return self.query(monitor)
+
+    def verify_unplug(self, out, monitor):
+        """Verify if it is unplugged from VM."""
+        return not self.query(monitor)
 
 
 class Memory(QObject):
@@ -2903,6 +3021,29 @@ class QCPUBus(QSparseBus):
                                    for d in range(cpuinfo.dies)
                                    for c in range(cpuinfo.cores)
                                    for t in range(cpuinfo.threads)][cpuinfo.smp]
+
+
+class QThrottleGroupBus(QSparseBus):
+    """ThrottleGroup virtual bus."""
+
+    def __init__(self, throttle_group_id):
+        """
+        ThrottleGroup bus constructor.
+
+        :param throttle_group_id: related ThrottleGroup object id
+        """
+        super(QThrottleGroupBus, self).__init__("throttle-group", [[], []],
+                                                "%s" % throttle_group_id,
+                                                "ThrottleGroup",
+                                                throttle_group_id)
+
+    def get_free_slot(self, addr_pattern):
+        """Return the device id as unoccupied address."""
+        return addr_pattern
+
+    def _dev2addr(self, device):
+        """Return the device id as address."""
+        return [device.get_qid()]
 
 
 class QIOThreadBus(QSparseBus):
